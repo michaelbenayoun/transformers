@@ -315,6 +315,22 @@ class HFTracer(Tracer):
         return super().create_arg(a)
 
 
+def _copy_attributes(attribute_names: Union[str, List[str]], src_object, tgt_object, override=False):
+    if isinstance(attribute_names, str):
+        if attribute_names == "all":
+            attribute_names = set(dir(src_object)) - set(dir(tgt_object))
+        else:
+            attribute_names = [attribute_names]
+
+    copied_attributes = []
+    for name in attribute_names:
+        if (not hasattr(src_object, name)) or (hasattr(tgt_object, name) and not override):
+            continue
+        setattr(tgt_object, name, copy.deepcopy(getattr(src_object, name)))
+        copied_attributes.append(name)
+    return copied_attributes
+
+
 def symbolic_trace(
     model: PreTrainedModel,
     input_names: Optional[List[str]] = None,
@@ -362,7 +378,14 @@ def symbolic_trace(
 
     tracer = HFTracer(batch_size=batch_size, sequence_length=sequence_length, num_choices=num_choices)
 
-    traced_graph = tracer.trace(model, concrete_args=concrete_args)
-    traced = torch.fx.GraphModule(model, traced_graph)
+    # Using a clone to trace the model to keep the original model and the traced version independants.
+    clone = copy.deepcopy(model)
+    traced_graph = tracer.trace(clone, concrete_args=concrete_args)
+    traced = torch.fx.GraphModule(clone, traced_graph)
+
+    traced.config = copy.deepcopy(model.config)
+    traced.dummy_inputs = dict()
+    for name in input_names:
+        traced.dummy_inputs.update(tracer._generate_dummy_input(model, name))
 
     return traced
