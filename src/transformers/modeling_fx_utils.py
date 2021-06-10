@@ -1,6 +1,8 @@
 import copy
 import functools
 import inspect
+import operator
+import random
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -109,8 +111,8 @@ def _monkey_patch_tensor_methods_for_model_recording(model, method_names):
     Helper function that patches torch.Tensor methods (specified by the method_names list) to record model inference
     before symbolic tracing.
     """
-    cache_names = dict()
-    original_methods = dict()
+    cache_names = {}
+    original_methods = {}
     for method_name in method_names:
         cache_name = f"cache_{method_name}"
         cache_names[method_name] = cache_name
@@ -158,6 +160,16 @@ class HFTracer(Tracer):
 
         self.prev_module = None
         self.recorded_methods = None
+
+    # def create_node(self, kind, target, args, kwargs, name=None, type_expr=None):
+    #     cached_value = None
+    #     if kind == "call_method" and self.recorded_methods and target in self.recorded_methods:
+    #         cache = getattr(self.root, self.recorded_methods[target])
+    #         cached_value = cache.pop(0)
+
+    #     node = super().create_node(kind, target, args, kwargs, name=name, type_expr=type_expr)
+    #     node.cached_value = cached_value
+    #     return node
 
     def proxy(self, node: Node):
         p = HFProxy(node, self)
@@ -322,11 +334,87 @@ def _copy_attributes(attribute_names: Union[str, List[str]], src_object, tgt_obj
     return copied_attributes
 
 
+def transform_to_dynamic_input(
+    gm,
+    input_names,
+    static_batch_size=-1,
+    static_encoder_sequence_length=-1,
+    static_decoder_sequence_length=-1,
+):
+    graph = gm.graph
+    mapping = {}
+    need_to_insert_encoder_shape_nodes = True
+    need_to_insert_decoder_shape_node = True
+    for node in graph.nodes:
+        if need_to_insert_encoder_shape_nodes and node.op == "placeholder" and node.name in input_names:
+            # TODO: handle the case for models with decoders.
+            with graph.inserting_after(node):
+                if static_batch_size > 0:
+                    batch_size_node = graph.call_method("size", args=(node, 0))
+                    mapping[static_batch_size] = batch_size_node
+                if static_encoder_sequence_length > 0:
+                    encoder_sequence_length_node = graph.call_method("size", args=(node, 1))
+                    mapping[static_encoder_sequence_length] = encoder_sequence_length_node
+                need_to_insert_encoder_shape_nodes = False
+
+        if (
+            need_to_insert_decoder_shape_node
+            and node.op == "placeholder"
+            and "decoder" in node.name
+            and node.name in input_names
+        ):
+            with graph.inserting_after(node):
+                if static_decoder_sequence_length > 0:
+                    decoder_sequence_length_node = graph.call_method("size", args=(node, 1))
+                    mapping[static_decoder_sequence_length] = decoder_sequence_length_node
+            need_to_insert_decoder_shape_node = False
+
+        if node.op == "call_method" and node.target == "view":
+            if isinstance(node.args[1], tuple):
+                node.args = (node.args[0], *node.args[1])
+            node.args = tuple((mapping.get(arg, arg) for arg in node.args))
+
+        if (
+            static_encoder_sequence_length > 0
+            and "position_ids" not in input_names
+            and "position_embeddings" in node.name
+        ):
+            setattr(gm, "position_ids", torch.arange(gm.config.max_position_embeddings).expand(1, -1))
+            initial_input = node.args[0]
+            with graph.inserting_before(node):
+                get_position_ids = graph.get_attr("position_ids")
+            with graph.inserting_after(get_position_ids):
+                position_ids = graph.call_function(
+                    operator.getitem,
+                    args=(
+                        get_position_ids,
+                        (slice(None, None, None), slice(None, encoder_sequence_length_node, None)),
+                    ),
+                )
+            node.args = (position_ids,)
+
+            # TODO: make sure everything is cleaned up after removing this.
+            graph.erase_node(initial_input)
+
+    graph.lint()
+    gm.recompile()
+    return gm
+
+
+def _generate_random_int(low=3, high=100, forbidden_values=None):
+    if forbidden_values is None:
+        forbidden_values = []
+    value = random.randint(low, high)
+    while value in forbidden_values:
+        value = random.randint(low, high)
+    return value
+
+
 def symbolic_trace(
     model: PreTrainedModel,
     input_names: Optional[List[str]] = None,
-    batch_size: int = 1,
-    sequence_length: Union[int, List[int]] = [128, 128],
+    batch_size: int = -1,
+    sequence_length: Union[int, List[int]] = -1,
     num_choices: int = -1,
 ) -> GraphModule:
 
@@ -338,9 +426,9 @@ def symbolic_trace(
             The model to trace.
         input_names (:obj:`List[str]`, `optional`):
             The names of the inputs of the traced model. If unset, model.dummy_inputs().keys() are used instead.
-        batch_size (:obj:`int`, `optional`, defaults to 1):
+        batch_size (:obj:`int`, `optional`, defaults to -1):
             The batch size of the traced model inputs.
-        sequence_length (:obj:`int` or :obj:`List[int]]`):
+        sequence_length (:obj:`int` or :obj:`List[int]]`, `optional`, defaults to -1):
             The sequence length of the traced model inputs. For sequence-to-sequence models with different sequence
             lengths between the encoder and the decoder inputs, this must be :obj:`[encoder_sequence_length,
             decoder_sequence_length]`.
@@ -367,6 +455,26 @@ def symbolic_trace(
     # TODO: how to handle the case of the "return_dict" parameter.
     concrete_args = {p.name: p.default for p in sig.parameters.values() if p.name not in input_names}
 
+    dynamic_batch_size = batch_size <= 0
+    if isinstance(sequence_length, (list, tuple)):
+        dynamic_sequence_length = sequence_length[0] <= 0
+    else:
+        dynamic_sequence_length = sequence_length <= 0
+    if dynamic_batch_size or dynamic_sequence_length:
+        forbidden_values = [
+            model.config.num_attention_heads,
+            model.config.hidden_size,
+            model.config.hidden_size // model.config.num_attention_heads,
+        ]
+        if dynamic_batch_size:
+            batch_size = _generate_random_int(forbidden_values=forbidden_values)
+        forbidden_values.append(batch_size)
+        if dynamic_sequence_length:
+            encoder_sequence_length = _generate_random_int(forbidden_values=forbidden_values)
+            forbidden_values.append(encoder_sequence_length)
+            decoder_sequence_length = _generate_random_int(forbidden_values=forbidden_values)
+            sequence_length = [encoder_sequence_length, decoder_sequence_length]
+
     tracer = HFTracer(batch_size=batch_size, sequence_length=sequence_length, num_choices=num_choices)
 
     # Using a clone to trace the model to keep the original model and the traced version independants.
@@ -375,8 +483,16 @@ def symbolic_trace(
     traced = torch.fx.GraphModule(clone, traced_graph)
 
     traced.config = copy.deepcopy(model.config)
-    traced.dummy_inputs = dict()
+    traced.dummy_inputs = {}
     for name in input_names:
         traced.dummy_inputs.update(tracer._generate_dummy_input(model, name))
+
+    static_batch_size = batch_size if dynamic_batch_size else -1
+    static_encoder_sequence_length = sequence_length[0] if dynamic_sequence_length else -1
+    static_decoder_sequence_length = sequence_length[1] if dynamic_sequence_length else -1
+
+    traced = transform_to_dynamic_input(
+        traced, input_names, static_batch_size, static_encoder_sequence_length, static_decoder_sequence_length
+    )
 
     return traced

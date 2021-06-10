@@ -50,8 +50,7 @@ def _merge_linears(gm, input_node, linear_nodes, linears):
 
 def merge_linears(gm):
     """
-    Transformation that merges linear layers that take the same input and have the same number of
-    output features.
+    Transformation that merges linear layers that take the same input and have the same number of output features.
     """
     candidates = defaultdict(list)
     named_modules = dict(gm.named_modules())
@@ -77,8 +76,8 @@ def merge_linears(gm):
 
 def apply_normalization_factor_to_query(gm):
     """
-    Transformation that applies the normalization factor directly to the query weights saving the
-    computation at runtime.
+    Transformation that applies the normalization factor directly to the query weights saving the computation at
+    runtime.
     """
     # TODO: add safety checks to make sure that the transformation is applied to attention layers.
     named_modules = dict(gm.named_modules())
@@ -106,10 +105,11 @@ def apply_normalization_factor_to_query(gm):
 def optimize_attention(gm):
     """
     Transformation that optimizes attention layers by:
+
         1. Appliying the normalization factor to the query weights instead of computing it at runtime
         2. Merging the query, key and value linear projections as one big linear projection.
-        3. Merging the transpose_for_scores by transposing the output of the merged linear
-            projection instead of doing it individually for the query, key and value.
+        3. Merging the transpose_for_scores by transposing the output of the merged linear projection instead of doing
+           it individually for the query, key and value.
     """
     gm = apply_normalization_factor_to_query(gm)
 
