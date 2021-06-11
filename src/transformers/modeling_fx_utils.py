@@ -336,12 +336,13 @@ def _copy_attributes(attribute_names: Union[str, List[str]], src_object, tgt_obj
 
 def transform_to_dynamic_input(
     gm,
-    input_names,
-    static_batch_size=-1,
-    static_encoder_sequence_length=-1,
-    static_decoder_sequence_length=-1,
+    dynamic_batch_size=False,
+    dynamic_encoder_sequence_length=False,
+    dynamic_decoder_sequence_length=False,
 ):
     graph = gm.graph
+    named_modules = dict(gm.named_modules())
+    input_names = gm.dummy_inputs.keys()
     mapping = {}
     need_to_insert_encoder_shape_nodes = True
     need_to_insert_decoder_shape_node = True
@@ -349,25 +350,25 @@ def transform_to_dynamic_input(
         if need_to_insert_encoder_shape_nodes and node.op == "placeholder" and node.name in input_names:
             # TODO: handle the case for models with decoders.
             with graph.inserting_after(node):
-                if static_batch_size > 0:
+                if dynamic_batch_size:
                     batch_size_node = graph.call_method("size", args=(node, 0))
-                    mapping[static_batch_size] = batch_size_node
-                if static_encoder_sequence_length > 0:
+                    mapping[gm.static_batch_size] = batch_size_node
+                if dynamic_encoder_sequence_length > 0:
                     encoder_sequence_length_node = graph.call_method("size", args=(node, 1))
-                    mapping[static_encoder_sequence_length] = encoder_sequence_length_node
+                    mapping[gm.static_sequence_length[0]] = encoder_sequence_length_node
                 need_to_insert_encoder_shape_nodes = False
 
-        if (
-            need_to_insert_decoder_shape_node
-            and node.op == "placeholder"
-            and "decoder" in node.name
-            and node.name in input_names
-        ):
-            with graph.inserting_after(node):
-                if static_decoder_sequence_length > 0:
-                    decoder_sequence_length_node = graph.call_method("size", args=(node, 1))
-                    mapping[static_decoder_sequence_length] = decoder_sequence_length_node
-            need_to_insert_decoder_shape_node = False
+        # if (
+        #     need_to_insert_decoder_shape_node
+        #     and node.op == "placeholder"
+        #     and "decoder" in node.name
+        #     and node.name in input_names
+        # ):
+        #     with graph.inserting_after(node):
+        #         if static_decoder_sequence_length > 0:
+        #             decoder_sequence_length_node = graph.call_method("size", args=(node, 1))
+        #             mapping[static_decoder_sequence_length] = decoder_sequence_length_node
+        #     need_to_insert_decoder_shape_node = False
 
         if node.op == "call_method" and node.target == "view":
             if isinstance(node.args[1], tuple):
@@ -375,11 +376,12 @@ def transform_to_dynamic_input(
             node.args = tuple((mapping.get(arg, arg) for arg in node.args))
 
         if (
-            static_encoder_sequence_length > 0
+            dynamic_encoder_sequence_length
             and "position_ids" not in input_names
             and "position_embeddings" in node.name
+            and isinstance(named_modules.get(node.target, None), torch.nn.Embedding)
         ):
-            setattr(gm, "position_ids", torch.arange(gm.config.max_position_embeddings).expand(1, -1))
+            gm.register_buffer("position_ids", torch.arange(gm.config.max_position_embeddings).expand(1, -1))
             initial_input = node.args[0]
             with graph.inserting_before(node):
                 get_position_ids = graph.get_attr("position_ids")
@@ -408,6 +410,21 @@ def _generate_random_int(low=3, high=100, forbidden_values=None):
     while value in forbidden_values:
         value = random.randint(low, high)
     return value
+
+
+def _generate_random_input_shape(model):
+    forbidden_values = [
+        model.config.num_attention_heads,
+        model.config.hidden_size,
+        model.config.hidden_size // model.config.num_attention_heads,
+    ]
+    batch_size = _generate_random_int(forbidden_values=forbidden_values)
+    forbidden_values.append(batch_size)
+    encoder_sequence_length = _generate_random_int(forbidden_values=forbidden_values)
+    forbidden_values.append(encoder_sequence_length)
+    decoder_sequence_length = _generate_random_int(forbidden_values=forbidden_values)
+    sequence_length = [encoder_sequence_length, decoder_sequence_length]
+    return batch_size, sequence_length
 
 
 def symbolic_trace(
@@ -455,25 +472,23 @@ def symbolic_trace(
     # TODO: how to handle the case of the "return_dict" parameter.
     concrete_args = {p.name: p.default for p in sig.parameters.values() if p.name not in input_names}
 
+    random_batch_size, random_sequence_length = _generate_random_input_shape(model)
     dynamic_batch_size = batch_size <= 0
     if isinstance(sequence_length, (list, tuple)):
-        dynamic_sequence_length = sequence_length[0] <= 0
+        dynamic_encoder_sequence_length = sequence_length[0] <= 0
+        dynamic_decoder_sequence_length = sequence_length[1] <= 0
     else:
-        dynamic_sequence_length = sequence_length <= 0
-    if dynamic_batch_size or dynamic_sequence_length:
-        forbidden_values = [
-            model.config.num_attention_heads,
-            model.config.hidden_size,
-            model.config.hidden_size // model.config.num_attention_heads,
-        ]
-        if dynamic_batch_size:
-            batch_size = _generate_random_int(forbidden_values=forbidden_values)
-        forbidden_values.append(batch_size)
-        if dynamic_sequence_length:
-            encoder_sequence_length = _generate_random_int(forbidden_values=forbidden_values)
-            forbidden_values.append(encoder_sequence_length)
-            decoder_sequence_length = _generate_random_int(forbidden_values=forbidden_values)
-            sequence_length = [encoder_sequence_length, decoder_sequence_length]
+        dynamic_encoder_sequence_length = dynamic_decoder_sequence_length = sequence_length <= 0
+
+    batch_size = random_batch_size if dynamic_batch_size else batch_size
+    if isinstance(sequence_length, int) and dynamic_encoder_sequence_length:
+        sequence_length = random_sequence_length
+    if isinstance(sequence_length, (list, tuple)):
+        sequence_length = list(sequence_length)
+        if dynamic_encoder_sequence_length:
+            sequence_length[0] = random_sequence_length[0]
+        if dynamic_decoder_sequence_length:
+            sequence_length[1] = random_sequence_length[1]
 
     tracer = HFTracer(batch_size=batch_size, sequence_length=sequence_length, num_choices=num_choices)
 
@@ -487,12 +502,14 @@ def symbolic_trace(
     for name in input_names:
         traced.dummy_inputs.update(tracer._generate_dummy_input(model, name))
 
-    static_batch_size = batch_size if dynamic_batch_size else -1
-    static_encoder_sequence_length = sequence_length[0] if dynamic_sequence_length else -1
-    static_decoder_sequence_length = sequence_length[1] if dynamic_sequence_length else -1
+    traced.static_batch_size = batch_size
+    traced.static_sequence_length = sequence_length
 
     traced = transform_to_dynamic_input(
-        traced, input_names, static_batch_size, static_encoder_sequence_length, static_decoder_sequence_length
+        traced,
+        dynamic_batch_size=dynamic_batch_size,
+        dynamic_encoder_sequence_length=dynamic_encoder_sequence_length,
+        dynamic_decoder_sequence_length=dynamic_decoder_sequence_length,
     )
 
     return traced
