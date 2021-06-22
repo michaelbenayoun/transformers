@@ -161,16 +161,6 @@ class HFTracer(Tracer):
         self.prev_module = None
         self.recorded_methods = None
 
-    # def create_node(self, kind, target, args, kwargs, name=None, type_expr=None):
-    #     cached_value = None
-    #     if kind == "call_method" and self.recorded_methods and target in self.recorded_methods:
-    #         cache = getattr(self.root, self.recorded_methods[target])
-    #         cached_value = cache.pop(0)
-
-    #     node = super().create_node(kind, target, args, kwargs, name=name, type_expr=type_expr)
-    #     node.cached_value = cached_value
-    #     return node
-
     def proxy(self, node: Node):
         p = HFProxy(node, self)
         if self.recorded_methods:
@@ -401,6 +391,54 @@ def transform_to_dynamic_input(
     graph.lint()
     gm.recompile()
     return gm
+
+
+def remove_loss_computation(gm: GraphModule):
+    graph = gm.graph
+    loss_related_names = ["labels", "start_positions", "end_positions"]
+    first_loss_related_node = None
+    for node in graph.nodes:
+        if any(name in node.name for name in loss_related_names):
+            first_loss_related_node = node
+            break
+    nodes_to_remove = [first_loss_related_node]
+    if first_loss_related_node:
+        users = first_loss_related_node.users.keys()
+        visited = set()
+        while users:
+            new_users = set()
+            for user in users:
+                if user in visited:
+                    continue
+                nodes_to_remove.append(user)
+                user_users = user.users.keys()
+                for n_user in user_users:
+                    new_users.add(n_user)
+                visited.add(user)
+            users = new_users
+
+    nodes_to_remove = [node for node in nodes_to_remove if node is not None]
+
+    for node in reversed(nodes_to_remove):
+        if node.op == "output":
+            new_outputs = []
+            for arg in node.args:
+                if isinstance(arg, dict):
+                    new_outputs.append({k: v for (k, v) in arg.items() if v not in nodes_to_remove})
+                else:
+                    if arg not in nodes_to_remove:
+                        new_outputs.append(arg)
+            node.args = tuple(new_outputs)
+        else:
+            graph.erase_node(node)
+
+    graph.lint()
+    gm.recompile()
+    return gm
+
+
+def make_inference_version(gm: GraphModule):
+    return remove_loss_computation(copy.deepcopy(gm))
 
 
 def _generate_random_int(low=3, high=100, forbidden_values=None):
