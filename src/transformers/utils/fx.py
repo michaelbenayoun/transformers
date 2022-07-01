@@ -1070,10 +1070,17 @@ def symbolic_trace(
     traced_graph = tracer.trace(model, concrete_args=concrete_args)
     traced = torch.fx.GraphModule(model, traced_graph)
 
-    traced.config = model.config
     # The model class must be stored as an attribute to allow model deserialization, which uses trace, and thus
     # _generate_dummy_input, where the model class is needed.
     traced.class_for_deserialization = model.__class__
     traced.device = model.device
+
+    for name, attr in vars(model).items():
+        setattr(traced, name, getattr(traced, name, attr))
+
+    # for name in dir(model):
+    #     attr = getattr(model, name)
+    #     if isinstance(attr, property):
+    #         setattr(traced, name, attr.__get__(traced))
 
     return traced
