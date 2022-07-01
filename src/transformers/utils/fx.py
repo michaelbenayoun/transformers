@@ -1078,9 +1078,4 @@ def symbolic_trace(
     for name, attr in vars(model).items():
         setattr(traced, name, getattr(traced, name, attr))
 
-    # for name in dir(model):
-    #     attr = getattr(model, name)
-    #     if isinstance(attr, property):
-    #         setattr(traced, name, attr.__get__(traced))
-
     return traced
