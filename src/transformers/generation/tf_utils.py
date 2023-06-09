@@ -751,7 +751,7 @@ class TFGenerationMixin:
                     self.generation_config = new_generation_config
             generation_config = self.generation_config
 
-        generation_config = copy.deepcopy(generation_config)
+        # generation_config = copy.deepcopy(generation_config)
         model_kwargs = generation_config.update(**kwargs)  # All unused kwargs must be model kwargs
         generation_config.validate()
         self._validate_model_kwargs(model_kwargs.copy())
@@ -868,22 +868,22 @@ class TFGenerationMixin:
             generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length
 
         # If the input length is a tensor (i.e. dynamic length), skip length checks
-        if not isinstance(input_ids_seq_length, tf.Tensor):
-            if (
-                generation_config.min_length is not None
-                and generation_config.min_length > generation_config.max_length
-            ):
-                raise ValueError(
-                    f"Unfeasable length constraints: the minimum length ({generation_config.min_length}) is larger"
-                    f" than the maximum length ({generation_config.max_length})"
-                )
-            if input_ids_seq_length >= generation_config.max_length:
-                input_ids_string = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
-                logger.warning(
-                    f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
-                    f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
-                    " increasing`max_new_tokens`."
-                )
+        # if not isinstance(input_ids_seq_length, tf.Tensor):
+        #     if (
+        #         generation_config.min_length is not None
+        #         and generation_config.min_length > generation_config.max_length
+        #     ):
+        #         raise ValueError(
+        #             f"Unfeasable length constraints: the minimum length ({generation_config.min_length}) is larger"
+        #             f" than the maximum length ({generation_config.max_length})"
+        #         )
+        #     if input_ids_seq_length >= generation_config.max_length:
+        #         input_ids_string = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+        #         logger.warning(
+        #             f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
+        #             f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
+        #             " increasing`max_new_tokens`."
+        #         )
 
         # 8. determine generation mode
         is_contrastive_search_gen_mode = (
@@ -903,6 +903,8 @@ class TFGenerationMixin:
             and (generation_config.num_beams > 1)
             and generation_config.do_sample is False
         )
+        is_greedy_gen_mode = False
+        is_beam_gen_mode = True
         is_sample_gen_mode = (generation_config.num_beams == 1) and generation_config.do_sample is True
         is_beam_sample_gen_mode = (generation_config.num_beams > 1) and generation_config.do_sample is True
 
@@ -950,39 +952,39 @@ class TFGenerationMixin:
                 return_dict_in_generate=generation_config.return_dict_in_generate,
                 **model_kwargs,
             )
-        elif is_sample_gen_mode:
-            # 11. prepare logits warper
-            logits_warper = self._get_logits_warper(generation_config=generation_config)
+        # elif is_sample_gen_mode:
+        #     # 11. prepare logits warper
+        #     logits_warper = self._get_logits_warper(generation_config=generation_config)
 
-            # 12. expand input_ids with `num_return_sequences` additional sequences per batch
-            input_ids, model_kwargs = self._expand_inputs_for_generation(
-                input_ids=input_ids,
-                expand_size=generation_config.num_return_sequences,
-                is_encoder_decoder=self.config.is_encoder_decoder,
-                **model_kwargs,
-            )
+        #     # 12. expand input_ids with `num_return_sequences` additional sequences per batch
+        #     input_ids, model_kwargs = self._expand_inputs_for_generation(
+        #         input_ids=input_ids,
+        #         expand_size=generation_config.num_return_sequences,
+        #         is_encoder_decoder=self.config.is_encoder_decoder,
+        #         **model_kwargs,
+        #     )
 
-            # 13. run sample
-            return self.sample(
-                input_ids,
-                logits_processor=logits_processor,
-                logits_warper=logits_warper,
-                max_length=generation_config.max_length,
-                pad_token_id=generation_config.pad_token_id,
-                eos_token_id=generation_config.eos_token_id,
-                seed=seed,
-                output_scores=generation_config.output_scores,
-                return_dict_in_generate=generation_config.return_dict_in_generate,
-                **model_kwargs,
-            )
+        #     # 13. run sample
+        #     return self.sample(
+        #         input_ids,
+        #         logits_processor=logits_processor,
+        #         logits_warper=logits_warper,
+        #         max_length=generation_config.max_length,
+        #         pad_token_id=generation_config.pad_token_id,
+        #         eos_token_id=generation_config.eos_token_id,
+        #         seed=seed,
+        #         output_scores=generation_config.output_scores,
+        #         return_dict_in_generate=generation_config.return_dict_in_generate,
+        #         **model_kwargs,
+        #     )
 
         elif is_beam_gen_mode:
-            if generation_config.num_beams < generation_config.num_return_sequences:
-                raise ValueError(
-                    "Beam search decoding cannot return more sequences than it has beams. Please set num_beams >="
-                    f" num_return_sequences, got {generation_config.num_beams} and"
-                    f" {generation_config.num_return_sequences} (respectivelly)"
-                )
+            # if generation_config.num_beams < generation_config.num_return_sequences:
+            #     raise ValueError(
+            #         "Beam search decoding cannot return more sequences than it has beams. Please set num_beams >="
+            #         f" num_return_sequences, got {generation_config.num_beams} and"
+            #         f" {generation_config.num_return_sequences} (respectivelly)"
+            #     )
 
             # 11. broadcast inputs to the desired number of beams
             input_ids, model_kwargs = self._expand_inputs_for_generation(
@@ -1984,6 +1986,7 @@ class TFGenerationMixin:
                 sample_seed = seed
             else:
                 sample_seed = tf.experimental.numpy.random.randint(tf.int32.min, tf.int32.max, (2,), dtype=tf.int32)
+            import pdb; pdb.set_trace()
             next_tokens = tf.squeeze(
                 tf.random.stateless_categorical(
                     logits=next_tokens_scores, num_samples=1, seed=sample_seed, dtype=tf.int32
@@ -2289,9 +2292,13 @@ class TFGenerationMixin:
         is_sent_finished = tf.zeros((batch_size, num_beams), dtype=tf.bool)
 
         # per batch, beam-item score, logprobs
-        running_scores = tf.tile(
-            tf.expand_dims(tf.convert_to_tensor([0.0] + [-1.0e9] * (num_beams - 1)), axis=0), [batch_size, 1]
-        )
+        print("num beams", num_beams)
+        shape = tf.stack([batch_size, num_beams - 1], axis=0)
+        negative_scores = tf.ones(shape) * -1.0e9
+        running_scores = tf.concat([tf.zeros((batch_size, 1)), negative_scores], axis=1)
+        # running_scores = tf.tile(
+        #     tf.expand_dims(tf.convert_to_tensor([0.0] + [-1.0e9] * (num_beams - 1)), axis=0), [batch_size, 1]
+        # )
         scores = tf.ones((batch_size, num_beams)) * -1.0e9
 
         # per batch beam indices
@@ -2449,7 +2456,7 @@ class TFGenerationMixin:
 
             # we want to store the beam indices with batch information -> real beam index = beam index % num beams
             batch_modified_indices = topk_current_beam_indices + tf.broadcast_to(
-                tf.expand_dims(tf.range(batch_size) * num_beams, axis=1), topk_current_beam_indices.shape
+                tf.expand_dims(tf.range(batch_size) * num_beams, axis=1), tf.shape(topk_current_beam_indices) #.shape
             )
             topk_beam_indices = tf.tensor_scatter_nd_update(
                 tensor=topk_running_beam_indices,
@@ -2467,7 +2474,7 @@ class TFGenerationMixin:
                 eos_in_next_token = tf.math.reduce_any(
                     tf.equal(
                         tf.broadcast_to(
-                            topk_sequences[:, :, cur_len], [len(eos_token_id)] + topk_sequences[:, :, cur_len].shape
+                            topk_sequences[:, :, cur_len], [len(eos_token_id)] + tf.shape(topk_sequences[:, :, cur_len]) #.shape
                         ),
                         tf.expand_dims(tf.expand_dims(eos_token_id, -1), -1),
                     ),
