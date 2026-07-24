@@ -27,7 +27,7 @@ export NEURON_RT_NUM_CORES=1
 # export NEURON_LOGICAL_NC_CONFIG=2
 # export NEURON_RT_VIRTUAL_CORE_SIZE=2
 TIMESTAMP=$(date +%H:%M-%d-%m)
-export NEURON_PROFILER_OUTPUT_DIR="./profile-hf-$TIMESTAMP"
+export NEURON_PROFILER_OUTPUT_DIR="./profile-hf-nll-no-metrics-$TIMESTAMP"
 export TORCH_NEURONX_NEFF_CACHE_DIR=$NEURON_PROFILER_OUTPUT_DIR
 export XLA_IR_DEBUG=1
 export XLA_HLO_DEBUG=1
@@ -81,6 +81,7 @@ $LAUNCHER \
     --num_train_epochs $NUM_EPOCHS \
     --packing false \
     --bf16 true \
+    --loss-type nll \
     --max_length $MAX_SEQ_LENGTH \
     --pad_to_multiple_of $MAX_SEQ_LENGTH \
     --per_device_train_batch_size $BATCH_SIZE \

@@ -1704,6 +1704,7 @@ class Trainer:
 
         import torch_neuronx
         from torch.profiler import ProfilerActivity, profile, record_function
+        from torch.profiler import schedule as profiler_schedule
         from torch_neuronx.profiling import NeuronConfig, NeuronProfiler, ProfileMode
 
         exp_config = NeuronConfig(
@@ -1712,6 +1713,14 @@ class Trainer:
             max_events_per_nc=100000,
         )
         exporter = NeuronProfiler(exp_config)
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=exp_config,
+            with_stack=True,
+            on_trace_ready=exporter.export_trace,
+            schedule=profiler_schedule(wait=0, warmup=3, active=1, repeat=1),
+        )
+        prof.start()
 
         # We chunkify the epoch iterator into gradient accumulation steps `n` batches
         remainder = steps_in_epoch % self.args.gradient_accumulation_steps
@@ -1758,17 +1767,8 @@ class Trainer:
                 else:
                     sync_context = functools.partial(self.accelerator.no_sync, model=model)
 
-                if 3 < step // self.args.gradient_accumulation_steps <= 4 and i == len(batch_samples) - 1:
-                    contexts = (
-                        sync_context(),
-                        profile(
-                            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
-                            experimental_config=exp_config,
-                            with_stack=True,
-                            on_trace_ready=exporter.export_trace,
-                        ),
-                        record_function("training_step"),
-                    )
+                if i == len(batch_samples) - 1:
+                    contexts = (sync_context(), record_function("training_step"))
                 else:
                     contexts = (sync_context(),)
                 with contextlib.ExitStack() as stack:
@@ -1813,6 +1813,7 @@ class Trainer:
 
                     model.zero_grad()
                     self.state.global_step += 1
+                    prof.step()
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
                     self._maybe_log_save_evaluate(
@@ -1835,6 +1836,7 @@ class Trainer:
 
         # Waiting for profiling.
         torch_neuronx.synchronize()
+        prof.stop()
         torch.distributed.barrier()
 
         # PyTorch/XLA relies on the dataloader to insert mark_step each iteration.

@@ -13,6 +13,7 @@ import time
 
 import torch
 import torch.distributed as dist
+import torch_neuronx
 from datasets import load_dataset
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import (
@@ -20,7 +21,7 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     parallelize_module,
 )
-from torch.profiler import profile, ProfilerActivity, record_function
+from torch.profiler import profile, ProfilerActivity, record_function, schedule as profiler_schedule
 from torch_neuronx.profiling import NeuronConfig, ProfileMode, NeuronProfiler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, TaskType
@@ -158,11 +159,16 @@ def main():
     parser.add_argument("--profile_max_events_per_nc", type=int, default=4_000_000)
     args = parser.parse_args()
 
-    # Initialize distributed training
-    backend = dist.Backend.default_device_backend_map.get("neuron")
-    dist.init_process_group(backend=backend)
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    # Initialize distributed training (only when launched via torchrun)
+    distributed = "RANK" in os.environ
+    if distributed:
+        backend = dist.Backend.default_device_backend_map.get("neuron")
+        dist.init_process_group(backend=backend)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
     device = torch.device("neuron")
 
     def log(msg):
@@ -274,16 +280,29 @@ def main():
     local_data = packed[dp_rank * rows_per_dp : (dp_rank + 1) * rows_per_dp]
 
     # PyTorch/Neuron profiler window (disabled unless --profile_num_steps > 0)
-    neuron_config = None
-    exporter = None
+    prof = None
+    profile_end_step = args.profile_step_start + args.profile_num_steps - 1
     if args.profile_num_steps > 0:
-        log(f"Profiling steps {args.profile_step_start}-{args.profile_step_start + args.profile_num_steps - 1}")
+        log(f"Profiling steps {args.profile_step_start}-{profile_end_step}")
         neuron_config = NeuronConfig(
             modes=[ProfileMode.DEVICE, ProfileMode.RUNTIME, ProfileMode.CPU_UTIL, ProfileMode.HOST_MEMORY],
             profile_output_dir=args.profile_output_dir,
             max_events_per_nc=args.profile_max_events_per_nc,
         )
         exporter = NeuronProfiler(neuron_config)
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=neuron_config,
+            with_stack=True,
+            on_trace_ready=exporter.export_trace,
+            schedule=profiler_schedule(
+                wait=0,
+                warmup=max(args.profile_step_start - 1, 0),
+                active=args.profile_num_steps,
+                repeat=1,
+            ),
+        )
+        prof.start()
 
     # Training loop
     step = 0
@@ -296,12 +315,6 @@ def main():
             optimizer.zero_grad()
             total_loss = 0.0
             total_tokens = 0
-
-            # 1-indexed update step this iteration is about to perform
-            current_update_step = step + 1
-            in_profile_window = neuron_config is not None and (
-                args.profile_step_start <= current_update_step < args.profile_step_start + args.profile_num_steps
-            )
 
             # Gradient accumulation loop
             for micro in range(args.gradient_accumulation_steps):
@@ -318,23 +331,12 @@ def main():
                     print(f"inputs: {inputs.shape}, labels: {labels.shape}")
                     _last_shape = inputs.shape
 
-                if in_profile_window and micro == args.gradient_accumulation_steps - 1:
-                    contexts = (
-                        profile(
-                            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
-                            experimental_config=neuron_config,
-                            with_stack=True,
-                            on_trace_ready=exporter.export_trace,
-                        ),
-                        record_function("training_step"),
-                    )
-                else:
-                    contexts = ()
-
-                with contextlib.ExitStack() as stack:
-                    for context in contexts:
-                        stack.enter_context(context)
-
+                step_ctx = (
+                    record_function("training_step")
+                    if prof is not None and micro == args.gradient_accumulation_steps - 1
+                    else contextlib.nullcontext()
+                )
+                with step_ctx:
                     # Forward and backward
                     loss = model(inputs, labels=labels).loss
                     (loss / args.gradient_accumulation_steps).backward()
@@ -350,6 +352,11 @@ def main():
             optimizer.step()
             scheduler.step()
             step += 1
+
+            if prof is not None:
+                if step <= profile_end_step:
+                    torch_neuronx.synchronize()
+                prof.step()
 
             # Logging
             if step % args.logging_steps == 0:
@@ -372,6 +379,9 @@ def main():
         if 0 < args.max_steps <= step:
             break
 
+    if prof is not None:
+        prof.stop()
+
     # Save final model
     if rank == 0:
         log(f"Saving final model to {args.output_dir}")
@@ -379,7 +389,8 @@ def main():
         tokenizer.save_pretrained(args.output_dir)
 
     log("Training complete")
-    dist.destroy_process_group()
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
