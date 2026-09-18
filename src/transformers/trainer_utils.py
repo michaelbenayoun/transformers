@@ -1054,7 +1054,7 @@ def check_target_module_exists(optim_target_modules, key: str, return_is_regex: 
     return target_module_found
 
 
-def load_sharded_checkpoint(model, folder, strict=True, prefer_safe=True):
+def load_sharded_checkpoint(model, folder, strict=True, prefer_safe=True, state_dict_processing_func=None):
     """
     This is the same as
     [`torch.nn.Module.load_state_dict`](https://pytorch.org/docs/stable/generated/torch.nn.Module.html?highlight=load_state_dict#torch.nn.Module.load_state_dict)
@@ -1071,6 +1071,8 @@ def load_sharded_checkpoint(model, folder, strict=True, prefer_safe=True):
         prefer_safe (`bool`, *optional*, defaults to `True`):
             If both safetensors and PyTorch save files are present in checkpoint and `prefer_safe` is True, the
             safetensors files will be loaded. Otherwise, PyTorch files are always loaded when possible.
+        state_dict_processing_func (`Callable[dict[str, torch.Tensor], dict[str, torch.Tensor]]`, *optional*):
+            A function that takes in a state dict and returns a processed state dict.
 
     Returns:
         `NamedTuple`: A named tuple with `missing_keys` and `unexpected_keys` fields
@@ -1120,6 +1122,8 @@ def load_sharded_checkpoint(model, folder, strict=True, prefer_safe=True):
 
     for shard_file in shard_files:
         state_dict = loader(os.path.join(folder, shard_file))
+        if state_dict_processing_func is not None:
+            state_dict = state_dict_processing_func(state_dict)
         model.load_state_dict(state_dict, strict=False)
 
         # Make sure memory is freed before we load the next state dict.

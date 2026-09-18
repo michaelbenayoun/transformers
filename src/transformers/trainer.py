@@ -57,7 +57,7 @@ from .configuration_utils import PreTrainedConfig
 from .data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
 from .debug_utils import DebugOption, DebugUnderflowOverflow
 from .distributed.fsdp import get_fsdp_ckpt_kwargs, update_fsdp_plugin_peft
-from .distributed.utils import clip_grad_norm_
+from .distributed.utils import clip_grad_norm_, distribute_state_dict_for_load, is_sharded_checkpoint
 from .feature_extraction_sequence_utils import SequenceFeatureExtractor
 from .feature_extraction_utils import FeatureExtractionMixin
 from .hyperparameter_search import ALL_HYPERPARAMETER_SEARCH_BACKENDS, default_hp_search_backend
@@ -618,15 +618,6 @@ class Trainer:
         self._created_lr_scheduler = False
         # Resolved lazily at the first gradient clip; see `_has_mixed_mesh_grads`.
         self._mixed_mesh_grads: bool | None = None
-        if (
-            getattr(model, "_device_mesh", None) is not None
-            and args.save_strategy != SaveStrategy.NO
-            and not args.save_only_model
-        ):
-            raise ValueError(
-                "Resuming is not supported for models sharded at load time (`DistributedConfig`), so their "
-                "optimizer state cannot be checkpointed. Pass `save_only_model=True` or `save_strategy='no'`."
-            )
 
         self.control = self.callback_handler.on_init_end(self.args, self.state, self.control)
 
@@ -3533,13 +3524,15 @@ class Trainer:
                     resume_from_checkpoint,
                     **get_fsdp_ckpt_kwargs(),
                 )
-            else:
+            elif getattr(self.model, "_device_mesh", None) is not None:
                 # We load the model state dict on the CPU to avoid an OOM error.
                 if os.path.isfile(safe_weights_file):
                     state_dict = safetensors.torch.load_file(safe_weights_file, device="cpu")
                 else:
                     check_torch_load_is_safe()
                     state_dict = torch.load(weights_file, map_location="cpu", weights_only=True)
+
+                state_dict = distribute_state_dict_for_load(self.model, state_dict)
 
                 # workaround for FSDP bug https://github.com/pytorch/pytorch/issues/82963
                 # which takes *args instead of **kwargs
@@ -3574,9 +3567,28 @@ class Trainer:
             else:
                 logger.warning(f"Could not load adapter model, make sure to have PEFT >= {MIN_PEFT_VERSION} installed")
         else:
-            # We load the sharded checkpoint
-            load_result = load_sharded_checkpoint(model, resume_from_checkpoint, strict=is_sagemaker_mp_enabled())
-            if not is_sagemaker_mp_enabled():
+            if getattr(self.model, "_device_mesh", None) is not None:
+                load_result = None
+                # In this case we have 3 possibilities:
+                #   1. `resume_from_checkpoint` contains the dtensor-sharded checkpoints
+                #   2. `resume_from_checkpoint` contains the directory `sharded/` that contains the dtensor-sharded
+                #       checkpoints
+                #   3. `resume_from_checkpoint` contains the sharded checkpoints (not dtensor-sharded)
+                if is_sharded_checkpoint(resume_from_checkpoint):
+                    self.model.load_distributed_checkpoint(resume_from_checkpoint)
+                elif is_sharded_checkpoint(os.path.join(resume_from_checkpoint, "sharded")):
+                    self.model.load_distributed_checkpoint(os.path.join(resume_from_checkpoint, "sharded"))
+                else:
+                    load_result = load_sharded_checkpoint(
+                        model,
+                        resume_from_checkpoint,
+                        strict=is_sagemaker_mp_enabled(),
+                        state_dict_processing_func=functools.partial(distribute_state_dict_for_load, model=self.model),
+                    )
+            else:
+                # We load the sharded checkpoint
+                load_result = load_sharded_checkpoint(model, resume_from_checkpoint, strict=is_sagemaker_mp_enabled())
+            if not is_sagemaker_mp_enabled() and load_result is not None:
                 self._issue_warnings_after_load(load_result)
 
     def _load_best_model(self) -> None:
