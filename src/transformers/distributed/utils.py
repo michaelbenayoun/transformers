@@ -14,12 +14,14 @@
 from __future__ import annotations
 
 import os
+import re
 import warnings
 from collections import defaultdict
 from datetime import timedelta
 from typing import TYPE_CHECKING, TypeGuard
 
 from ..utils import is_torch_available, is_torch_distributed_available, is_torch_greater_or_equal, logging
+from .sharding_utils import DtensorShardOperation, _dtensor_from_local_like
 
 
 logger = logging.get_logger(__name__)
@@ -306,6 +308,14 @@ def _prepare_state_dict_for_dcp(state_dict):
     return tree_map(prepare, state_dict)
 
 
+def is_sharded_checkpoint(checkpoint_dir: str | os.PathLike) -> bool:
+    """Return True if the checkpoint directory contains sharded safetensors files."""
+    pattern = r"^shard-[0-9]{5}-model-[0-9]{5}-of-[0-9]{5}\.safetensors$"
+    if not os.path.isdir(checkpoint_dir):
+        return False
+    return any(re.match(pattern, name) for name in os.listdir(checkpoint_dir))
+
+
 def save_model_checkpoint_distributed(model, checkpoint_dir: str, *, consolidate: bool = True) -> None:
     """Save rank-local model shards as safetensors with DCP, optionally consolidating them.
 
@@ -351,8 +361,7 @@ def load_model_checkpoint_distributed(model, checkpoint_dir: str | os.PathLike) 
     from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
 
-    has_safetensors = any(name.endswith(".safetensors") for name in os.listdir(checkpoint_dir))
-    if not has_safetensors:
+    if not is_sharded_checkpoint(checkpoint_dir):
         raise ValueError(f"No safetensors files found in {checkpoint_dir}.")
 
     reader = HuggingFaceStorageReader(str(checkpoint_dir))
@@ -366,6 +375,33 @@ def load_model_checkpoint_distributed(model, checkpoint_dir: str | os.PathLike) 
         if is_dtensor(value) and value.placements != original_state[name].placements:
             state[name] = value.redistribute(placements=original_state[name].placements)
     set_model_state_dict(model, state)
+
+
+def _distribute_tensor_for_load(tensor: torch.Tensor, destination: torch.Tensor):
+    """Convert a full tensor into a DTensor matching destination's placement."""
+    if not is_dtensor(destination):
+        return tensor
+    if tensor.shape != destination.shape:
+        raise ValueError(f"Cannot load tensor of shape {tensor.shape} into destination of shape {destination.shape}")
+
+    shard = DtensorShardOperation(destination).shard_tensor(tensor, device=destination.device, dtype=destination.dtype)
+    return _dtensor_from_local_like(shard, destination)
+
+
+def distribute_state_dict_for_load(
+    model: torch.nn.Module, state_dict: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """Convert a state dict of full tensors into a state dict of DTensors matching the destination's placements."""
+
+    model_state_dict = model.state_dict()
+
+    for name, tensor in state_dict.items():
+        destination = model_state_dict.get(name)
+        if is_dtensor(destination) and not is_dtensor(tensor):
+            state_dict[name] = _distribute_tensor_for_load(tensor, destination)
+
+    # TO CODEX: should we return something since it changes the dict in place?
+    return state_dict
 
 
 def save_optimizer_distributed(model, optimizer, checkpoint_dir: str, *, consolidate: bool = False) -> None:
