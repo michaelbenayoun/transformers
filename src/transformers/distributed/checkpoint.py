@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import re
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -225,11 +224,13 @@ def save_sharded_state_dict(
         queued_bytes[owner] += sum(tensor.nbytes for tensor in outputs.values())
     order = [group_index for _, _, group_index in sorted(order)]
 
-    for filename, (header, size) in headers.items():
-        if file_owner[filename] == rank:
-            _create_safetensors_file(os.path.join(save_directory, filename), header, size)
-
-    writer = _SafetensorsWriter(save_directory, locations)
+    fds = {
+        filename: _create_safetensors_file(os.path.join(save_directory, filename), header)
+        for filename, header in headers.items()
+        if file_owner[filename] == rank
+    }
+    device = next((tensor.device for tensor in state_dict.values()), torch.device("cpu"))
+    writer = _SafetensorsWriter(fds, locations, device)
     try:
         with torch.no_grad():
             for group_index in order:
@@ -267,7 +268,7 @@ def save_sharded_state_dict(
 # Bytes of gathered weights a rank can queue for its writer thread before the gathers wait for it.
 _MAX_PENDING_WRITE_BYTES = 2**30
 # Size of each of the two pinned buffers that stream a device tensor to its file.
-_STAGING_BUFFER_BYTES = 64 * 2**20
+_STAGING_BUFFER_BYTES = 128 * 2**20
 
 
 @lru_cache
@@ -280,9 +281,9 @@ def _safetensors_dtype(dtype: torch.dtype) -> str:
 
 def _plan_safetensors_files(
     filename_to_tensors: dict[str, list[str]], tensors: dict[str, torch.Tensor], metadata: dict[str, str] | None
-) -> tuple[dict[str, tuple[bytes, int]], dict[str, tuple[str, int]]]:
+) -> tuple[dict[str, bytes], dict[str, tuple[str, int]]]:
     """
-    Build the header and size of every safetensors file from meta `tensors`, and the location (file and absolute
+    Build the header of every safetensors file from meta `tensors`, and the location (file and absolute
     byte offset) of every tensor. Like `safetensors`, larger dtypes come first so that every tensor is aligned on its dtype.
     """
     headers, locations = {}, {}
@@ -303,14 +304,9 @@ def _plan_safetensors_files(
         # The data starts on an 8-byte boundary, as in files written by `safetensors`.
         header += b" " * (-len(header) % 8)
         header = len(header).to_bytes(8, "little") + header
-        headers[filename] = (header, len(header) + offset)
+        headers[filename] = header
         locations.update({name: (filename, len(header) + tensor_offset) for name, tensor_offset in offsets.items()})
     return headers, locations
-
-
-def _open_for_writing(path: str, flags: int = 0) -> int:
-    # `O_BINARY` only exists, and is needed, on Windows.
-    return os.open(path, os.O_WRONLY | getattr(os, "O_BINARY", 0) | flags)
 
 
 def _write_at(fd: int, data: memoryview, offset: int) -> None:
@@ -320,101 +316,125 @@ def _write_at(fd: int, data: memoryview, offset: int) -> None:
         data = data[os.write(fd, data) :]
 
 
-def _create_safetensors_file(path: str, header: bytes, size: int) -> None:
-    fd = _open_for_writing(path, os.O_CREAT | os.O_TRUNC)
+def _create_safetensors_file(path: str, header: bytes) -> int:
+    """Create the file with its header, and return it open for writing the tensors at their planned offsets."""
+    # `O_BINARY` only exists, and is needed, on Windows.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0))
     try:
         _write_at(fd, memoryview(header), 0)
-        os.ftruncate(fd, size)
-    finally:
+    except BaseException:
         os.close(fd)
+        raise
+    return fd
 
 
 class _SafetensorsWriter:
     """
-    Writes tensors at their planned location from a background thread, so that the gathers of the next weights do
-    not wait for the copies to CPU and the writes. A device tensor is copied through two reused pinned buffers: one is
-    written to the file while the next chunk is copied into the other.
+    Write tensors at the planned location:
+        - `fds`: file descriptors of the files to write, open for writing at the planned offsets.
+        - `locations`: maps every tensor name to the file and absolute byte offset to write it at.
+        - `device`: the device of the tensors to write, or "cpu" if they are all on CPU.
+
+    The idea is to make the writes efficient and non blocking, with three ideas:
+        1. It is non blocking so that the main thread can keep gathering tensors while the writes are done in the
+           background.
+        2. It does not hold more than `_MAX_PENDING_WRITE_BYTES` of gathered tensors to avoid using too much memory.
+        3. A submitted write job is divided in two steps:
+            - Copying the tensor on device to a pinned buffer on CPU.
+            - Writing the pinned buffer to the file.
+            To make things fast, we overlap these two steps.
+            We use two pinned buffers, chunk the tensor into pieces, and overlap the copy of the one chunk with
+            the write of the previous one.
     """
 
-    def __init__(self, directory: str | os.PathLike, locations: dict[str, tuple[str, int]]):
-        self._directory = directory
+    def __init__(self, fds: dict[str, int], locations: dict[str, tuple[str, int]], device: torch.device):
+        self._fds = fds
         self._locations = locations
-        self._fds: dict[str, int] = {}
-        self._queue: queue.Queue = queue.Queue()
+        # A single worker: the writes share the staging buffers, the stream and the file descriptors, and finish in
+        # the order they were submitted.
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="safetensors-writer")
+
+        # The writes not checked yet with their sizes, and the total of those sizes: a tensor stays in memory until it
+        # is written, so `submit` keeps this total under `_MAX_PENDING_WRITE_BYTES` to bound the memory they hold.
+        self._pending: deque[tuple[Future, int]] = deque()
         self._pending_bytes = 0
-        self._condition = threading.Condition()
-        self._error: BaseException | None = None
-        self._stream = None
-        self._buffers = None
-        self._thread = threading.Thread(target=self._run, name="safetensors-writer", daemon=True)
-        self._thread.start()
+
+        # Device tensors are copied to CPU on a side stream, so that the copies overlap the gathers on the current
+        # stream.
+        self._stream = self._buffers = self._copied = None
+
+        # Only torch 2.7 supports the `torch.Stream` generic API.
+        if device.type != "cpu" and fds and is_torch_greater_or_equal("2.7"):
+            self._stream = torch.Stream(device=device)
+            self._buffers = [torch.empty(_STAGING_BUFFER_BYTES, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
+            # Side stream.
+            self._copied = [torch.Event(device=device) for _ in range(2)]
 
     def submit(self, name: str, tensor: torch.Tensor) -> None:
+        """
+        Submits a tensor to be written at its planned location in the file.
+        """
         # Flat bytes, made on the current stream so the writer only has to wait for it.
         data = tensor.contiguous().reshape(-1).view(torch.uint8)
-        with self._condition:
-            while (
-                self._error is None
-                and self._pending_bytes > 0
-                and self._pending_bytes + data.numel() > _MAX_PENDING_WRITE_BYTES
-            ):
-                self._condition.wait()
-            if self._error is not None:
-                raise RuntimeError("Writing the safetensors files failed.") from self._error
-            self._pending_bytes += data.numel()
         ready = None
-        if data.device.type == "cuda":
-            ready = torch.cuda.Event()
-            ready.record()
-        self._queue.put((name, data, ready))
+        if data.device.type != "cpu":
+            if self._stream is None:
+                # Without a side stream (torch < 2.7), copy to CPU on the current stream, which blocks.
+                data = data.cpu()
+            else:
+                # Marks the end of the work producing `data` on the current stream: the side stream waits for it
+                # before copying.
+                ready = torch.Event(device=data.device)
+                ready.record()
+
+        # Wait for the writes that are done or that would make the pending bytes exceed the limit, so that the next write
+        # can be submitted without holding too much memory.
+        while self._pending and (
+            self._pending[0][0].done() or self._pending_bytes + data.numel() > _MAX_PENDING_WRITE_BYTES
+        ):
+            future, size = self._pending.popleft()
+            self._pending_bytes -= size
+            future.result()
+
+        # Submit the write to the background thread.
+        filename, offset = self._locations[name]
+        self._pending.append((self._pool.submit(self._write, self._fds[filename], data, offset, ready), data.numel()))
+        self._pending_bytes += data.numel()
 
     def close(self) -> None:
-        self._queue.put(None)
-        self._thread.join()
-        for fd in self._fds.values():
-            os.close(fd)
-        if self._error is not None:
-            raise RuntimeError("Writing the safetensors files failed.") from self._error
+        try:
+            self._pool.shutdown(wait=True)
+            for future, _ in self._pending:
+                future.result()
+        finally:
+            for fd in self._fds.values():
+                os.close(fd)
 
-    def _run(self) -> None:
-        while (item := self._queue.get()) is not None:
-            name, data, ready = item
-            try:
-                if self._error is None:
-                    filename, offset = self._locations[name]
-                    if filename not in self._fds:
-                        self._fds[filename] = _open_for_writing(os.path.join(self._directory, filename))
-                    self._write(self._fds[filename], data, offset, ready)
-            except BaseException as error:
-                self._error = error
-            with self._condition:
-                self._pending_bytes -= data.numel()
-                self._condition.notify_all()
-            del item, data, ready
-
-    def _write(self, fd: int, data: torch.Tensor, offset: int, ready) -> None:
-        if data.device.type != "cuda":
-            _write_at(fd, memoryview(data.cpu().numpy()), offset)
-            return
+    def _write(self, fd: int, data: torch.Tensor, offset: int, ready: torch.Event | None) -> None:
         if self._stream is None:
-            self._stream = torch.cuda.Stream(device=data.device)
-            self._buffers = [torch.empty(_STAGING_BUFFER_BYTES, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
-        copied = [torch.cuda.Event(), torch.cuda.Event()]
+            _write_at(fd, memoryview(data.numpy()), offset)
+            return
         previous = None
-        with torch.cuda.stream(self._stream):
+        with self._stream:
+            # Waiting for `ready` on the side stream, meaning that `data` has been computed on device and is ready to
+            # be written.
             self._stream.wait_event(ready)
             for index, start in enumerate(range(0, data.numel(), _STAGING_BUFFER_BYTES)):
                 chunk = data[start : start + _STAGING_BUFFER_BYTES]
                 # The buffer is free: its previous chunk was written before this loop iteration.
                 buffer = self._buffers[index % 2][: chunk.numel()]
+                # Only queues the copy into the pinned buffer: the event tells when it is done.
                 buffer.copy_(chunk, non_blocking=True)
-                copied[index % 2].record()
+                self._copied[index % 2].record(self._stream)
+
                 # Write the previous chunk while this one is copied.
                 if previous is not None:
                     previous_buffer, previous_start, previous_event = previous
+                    # Wait for the copy of the previous chunk to finish before writing it to the file.
                     previous_event.synchronize()
                     _write_at(fd, memoryview(previous_buffer.numpy()), offset + previous_start)
-                previous = (buffer, start, copied[index % 2])
+                previous = (buffer, start, self._copied[index % 2])
+
         if previous is not None:
             previous_buffer, previous_start, previous_event = previous
             previous_event.synchronize()
