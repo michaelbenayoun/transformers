@@ -177,7 +177,9 @@ def save_sharded_state_dict(
         1. Everything is planned on meta tensors with the global shapes, so every rank gets the same plan without
            moving any data.
         2. File `i` is written by rank `i % world_size`.
-        3. All ranks join the `full_tensor()` gathers of every group, in the same order.
+        3. The weights are gathered group by group: a group is the weights reverted together by one weight conversion.
+           Every rank joins each `full_tensor()` gather, since it is a collective, but only the owners of the files
+           the group's weights go to revert them and write them from a background thread.
 
     Returns the split of the reverted state dict and the weight map of the files that were written.
     """

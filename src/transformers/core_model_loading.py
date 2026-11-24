@@ -2025,8 +2025,8 @@ def _revert_weight_conversion_per_transform(
     model: PreTrainedModel, state_dict: dict[str, torch.Tensor]
 ) -> list[tuple[list[str], dict[str, torch.Tensor]]]:
     """
-    Same as `revert_weight_conversion`, but returns one `(input_names, reverted_weights)` pair per reverse transform:
-    `input_names` are the names of `state_dict` that the transform reverts together into `reverted_weights`.
+    Returns the list of reverted transforms defined by the conversion mapping that was used to load the model with
+    `from_pretrained`, or the default one if the model was created in another way and is part of the default mappings.
     """
     weight_conversions = getattr(model, "_weight_conversions", None)
     # In this case, the model was not created with `from_pretrained` -> let's check if it's in the hardcoded
