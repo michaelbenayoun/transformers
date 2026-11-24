@@ -56,7 +56,7 @@ if is_torch_available():
     from safetensors.torch import save_file as safe_save_file
     from torch.utils._pytree import tree_map
 
-    from ..core_model_loading import get_reverse_conversion_groups, revert_weight_conversion
+    from ..core_model_loading import _revert_weight_conversion_per_transform, revert_weight_conversion
 
 if _check_distributed_checkpointing_available():
     from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader, HuggingFaceStorageWriter
@@ -175,12 +175,9 @@ def save_sharded_state_dict(
     Every rank must call this function.
 
         1. Everything is planned on meta tensors with the global shapes, so every rank gets the same plan without
-           moving any data: the groups of weights that are reverted together, the reverted weights, their split
-           into files of at most `max_shard_size`, and the byte offset of every weight in its file.
+           moving any data.
         2. File `i` is written by rank `i % world_size`.
-        3. All ranks join the `full_tensor()` gathers of every group, in the same order. The owners of the files
-           the group's weights go to revert the weight conversions on device and hand their weights to a background
-           thread, which streams them through pinned buffers into their files, at their planned offsets.
+        3. All ranks join the `full_tensor()` gathers of every group, in the same order.
 
     Returns the split of the reverted state dict and the weight map of the files that were written.
     """
@@ -201,10 +198,11 @@ def save_sharded_state_dict(
 
     meta_state_dict = to_meta(state_dict)
     if save_original_format:
-        groups = get_reverse_conversion_groups(model, meta_state_dict)
+        reverted_groups = _revert_weight_conversion_per_transform(model, meta_state_dict)
     else:
-        groups = [[name] for name in meta_state_dict]
-    planned_outputs = [to_meta(revert({name: meta_state_dict[name] for name in group})) for group in groups]
+        reverted_groups = [([name], {name: tensor}) for name, tensor in meta_state_dict.items()]
+    groups = [input_names for input_names, _ in reverted_groups]
+    planned_outputs = [to_meta(reverted) for _, reverted in reverted_groups]
     reverted_state_dict = {name: tensor for outputs in planned_outputs for name, tensor in outputs.items()}
 
     state_dict_split = split_torch_state_dict_into_shards(
